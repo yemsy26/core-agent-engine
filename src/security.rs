@@ -2,23 +2,35 @@ use regex::Regex;
 
 use crate::types::EngineError;
 
+/// Defines the kind of tool being requested.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolKind {
     Bash,
 }
 
+/// A security event emitted by the firewall upon evaluation.
+#[derive(Clone, Debug)]
+pub enum SecurityEvent {
+    Allowed { tool: ToolKind, command: String },
+    Denied { tool: ToolKind, command: String },
+}
+
+/// A single permission rule evaluated by the firewall.
 #[derive(Clone, Debug)]
 pub struct PermissionRule {
     pub tool: ToolKind,
     pub pattern: Regex,
 }
 
+/// The deterministic permission firewall policy.
 #[derive(Clone, Debug, Default)]
 pub struct PermissionPolicy {
     pub allow: Vec<PermissionRule>,
     pub deny: Vec<PermissionRule>,
+    pub event_tx: Option<tokio::sync::mpsc::Sender<SecurityEvent>>,
 }
 
+/// The decision made by the firewall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,
@@ -26,6 +38,7 @@ pub enum PermissionDecision {
 }
 
 impl PermissionPolicy {
+    /// Evaluates a command against the firewall rules.
     pub fn decide(&self, tool: ToolKind, command: &str) -> PermissionDecision {
         if self
             .deny
@@ -44,8 +57,25 @@ impl PermissionPolicy {
         PermissionDecision::Deny
     }
 
-    pub fn enforce(&self, tool: ToolKind, command: &str) -> Result<(), EngineError> {
-        match self.decide(tool, command) {
+    /// Enforces the policy and streams the event to the audit channel.
+    pub async fn enforce(&self, tool: ToolKind, command: &str) -> Result<(), EngineError> {
+        let decision = self.decide(tool, command);
+
+        if let Some(tx) = &self.event_tx {
+            let event = match decision {
+                PermissionDecision::Allow => SecurityEvent::Allowed {
+                    tool,
+                    command: command.to_string(),
+                },
+                PermissionDecision::Deny => SecurityEvent::Denied {
+                    tool,
+                    command: command.to_string(),
+                },
+            };
+            let _ = tx.send(event).await;
+        }
+
+        match decision {
             PermissionDecision::Allow => Ok(()),
             PermissionDecision::Deny => Err(EngineError::PermissionDenied(format!(
                 "{tool:?}({command})"
@@ -54,7 +84,7 @@ impl PermissionPolicy {
     }
 }
 
-// Parses strings like: Bash(npm .*)
+/// Parses strings like: Bash(npm .*) into a PermissionRule.
 pub fn parse_permission_rule(s: &str) -> Result<PermissionRule, EngineError> {
     let (tool_str, rest) = s
         .split_once('(')

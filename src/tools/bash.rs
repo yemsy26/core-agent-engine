@@ -5,11 +5,13 @@ use tokio::process::Command;
 use crate::security::{PermissionPolicy, ToolKind};
 use crate::types::EngineError;
 
+/// Command payload for Bash executions.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct BashCommand {
     pub command: String,
 }
 
+/// The result of a executed Bash command.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct BashResult {
     pub exit_code: i32,
@@ -18,17 +20,45 @@ pub struct BashResult {
 }
 
 impl BashCommand {
+    /// Executes the Bash command within the deterministic firewall and performs physical verification.
     pub async fn run(&self, policy: &PermissionPolicy) -> Result<BashResult, EngineError> {
-        policy.enforce(ToolKind::Bash, &self.command)?;
+        policy.enforce(ToolKind::Bash, &self.command).await?;
 
-        if cfg!(windows) {
+        let result = if cfg!(windows) {
             run_windows_powershell(&self.command).await
         } else {
             run_posix_sh(&self.command).await
+        }?;
+
+        if result.exit_code == 0 {
+            self.verify_physical_mutation().await?;
         }
+
+        Ok(result)
+    }
+
+    /// Actively verifies physical changes in the filesystem to prevent hallucinated success states.
+    async fn verify_physical_mutation(&self) -> Result<(), EngineError> {
+        let parts: Vec<&str> = self.command.split_whitespace().collect();
+        if parts.is_empty() {
+            return Ok(());
+        }
+
+        let is_mutation = matches!(parts[0], "mkdir" | "touch" | "cp" | "mv");
+        if is_mutation && parts.len() > 1 {
+            let target = parts.last().unwrap();
+            if !std::path::Path::new(target).exists() {
+                return Err(EngineError::ToolExecution(format!(
+                    "Physical verification failed: target path '{}' does not exist after execution.",
+                    target
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
+/// Executes commands using POSIX sh.
 async fn run_posix_sh(command: &str) -> Result<BashResult, EngineError> {
     let output = Command::new("sh")
         .arg("-lc")
@@ -46,12 +76,8 @@ async fn run_posix_sh(command: &str) -> Result<BashResult, EngineError> {
     })
 }
 
+/// Executes commands using Windows PowerShell with strict exit code handling.
 async fn run_windows_powershell(command: &str) -> Result<BashResult, EngineError> {
-    // Based on leaked robustness logic:
-    // Prefer $LASTEXITCODE when a native exe ran, because $? can become $false when stderr is redirected.
-    // This wrapper forces a final explicit exit with the computed code.
-    //
-    // We also emit a unique marker line with the numeric exit code so we can parse it reliably.
     const MARKER: &str = "__CORE_AGENT_ENGINE_EXITCODE__";
 
     let script = format!(
